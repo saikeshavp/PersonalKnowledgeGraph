@@ -52,7 +52,7 @@ class GraphRAGEngine:
             return vector_store.generate_embeddings([text])[0]
         except Exception as e:
             print(f"Embedding error: {e}")
-            return [0.0] * 384
+            return [0.0] * 768
     
     # ============================================================
     # Core GraphRAG Query Methods

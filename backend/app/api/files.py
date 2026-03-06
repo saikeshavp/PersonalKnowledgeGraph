@@ -29,24 +29,50 @@ async def list_files(
     try:
         documents = neo4j_client.get_all_documents()
         
-        files = []
+        # Batch-fetch all entity counts in one pass to avoid N+1 queries
+        entity_counts = {}
         for doc in documents:
-            # Get entity count for this document
-            entity_count = neo4j_client.get_entity_count_by_doc(doc["id"])
+            entity_counts[doc["id"]] = 0
+        
+        # Single query to get all entity counts grouped by source_doc
+        all_entities = neo4j_client.get_all_entities(limit=5000)
+        filename_to_doc_id = {doc.get("filename", ""): doc["id"] for doc in documents}
+        for entity in all_entities:
+            source_doc = entity.get("source_doc", "")
+            doc_id = filename_to_doc_id.get(source_doc)
+            if doc_id:
+                entity_counts[doc_id] = entity_counts.get(doc_id, 0) + 1
+        
+        files = []
+        uploads_dir = Path("./uploads")
+        
+        for doc in documents:
+            doc_id = doc["id"]
+            filename = doc.get("filename", "Unknown")
+            doc_file_type = doc.get("file_type", filename.split(".")[-1].lower() if "." in filename else "unknown")
+            
+            # Apply file type filter early
+            if file_type and doc_file_type != file_type.lower():
+                continue
+            
+            # Get file size from disk
+            file_size = None
+            try:
+                matching = list(uploads_dir.glob(f"{doc_id}_*"))
+                if matching:
+                    file_size = matching[0].stat().st_size
+            except Exception:
+                pass
             
             file_info = FileInfo(
-                file_id=doc["id"],
-                filename=doc.get("filename", "Unknown"),
-                file_type=doc.get("file_type", doc.get("filename", "").split(".")[-1].lower()),
+                file_id=doc_id,
+                filename=filename,
+                file_type=doc_file_type,
                 upload_date=doc.get("upload_date", ""),
-                entity_count=entity_count,
+                entity_count=entity_counts.get(doc_id, 0),
                 status="complete"
             )
             
-            # Apply file type filter
-            if file_type and file_info.file_type != file_type.lower():
-                continue
-                
             files.append(file_info)
         
         return files
@@ -77,13 +103,18 @@ async def search_files(request: FileSearchRequest):
         file_scores = {}
         file_matched_chunks = {}
         file_matched_entities = {}
+        file_chunk_counts = {}  # Track chunk count for averaging
         
-        # Process semantic search results
-        for result in semantic_results:
-            doc_id = result["metadata"].get("doc_id", "")
-            if not doc_id:
-                continue
-            
+        # Build a local cache for filename -> doc_id lookups to avoid repeated DB calls
+        _filename_to_doc_id_cache = {}
+
+        def _cached_get_doc_id(filename: str) -> Optional[str]:
+            if filename not in _filename_to_doc_id_cache:
+                _filename_to_doc_id_cache[filename] = neo4j_client.get_doc_id_by_filename(filename)
+            return _filename_to_doc_id_cache[filename]
+
+        def _ensure_file_entry(doc_id: str):
+            """Initialize tracking dicts for a new doc_id."""
             if doc_id not in file_scores:
                 file_scores[doc_id] = {
                     "semantic_score": 0.0,
@@ -92,10 +123,20 @@ async def search_files(request: FileSearchRequest):
                 }
                 file_matched_chunks[doc_id] = []
                 file_matched_entities[doc_id] = set()
+                file_chunk_counts[doc_id] = 0
+        
+        # Process semantic search results
+        for result in semantic_results:
+            doc_id = result["metadata"].get("doc_id", "")
+            if not doc_id:
+                continue
             
-            # Add semantic similarity score
+            _ensure_file_entry(doc_id)
+            
+            # Add semantic similarity score (accumulate for averaging)
             score = result.get("score", 0)
             file_scores[doc_id]["semantic_score"] += score
+            file_chunk_counts[doc_id] += 1
             
             # Store matched chunk text (limit to first 200 chars)
             chunk_preview = result["text"][:200] + "..." if len(result["text"]) > 200 else result["text"]
@@ -104,57 +145,56 @@ async def search_files(request: FileSearchRequest):
                 "score": score
             })
         
+        # Average the semantic scores instead of summing
+        for doc_id in file_scores:
+            count = file_chunk_counts.get(doc_id, 1)
+            if count > 0:
+                file_scores[doc_id]["semantic_score"] /= count
+        
         # Process matching entities and their related documents
         for entity in matching_entities:
             source_doc = entity.get("source_doc", "")
-            doc_id = neo4j_client.get_doc_id_by_filename(source_doc)
+            doc_id = _cached_get_doc_id(source_doc)
             
-            if doc_id and doc_id not in file_scores:
-                file_scores[doc_id] = {
-                    "semantic_score": 0.0,
-                    "entity_score": 0.0,
-                    "graph_score": 0.0
-                }
-                file_matched_chunks[doc_id] = []
-                file_matched_entities[doc_id] = set()
+            if not doc_id:
+                continue
             
-            if doc_id:
-                file_scores[doc_id]["entity_score"] += 1.0
-                file_matched_entities[doc_id].add(entity["name"])
+            _ensure_file_entry(doc_id)
+            file_scores[doc_id]["entity_score"] += 1.0
+            file_matched_entities[doc_id].add(entity["name"])
+            
+            # Step 4: Graph traversal - find related entities
+            neighbors = neo4j_client.get_entity_neighbors(entity["id"], max_depth=2)
+            for neighbor in neighbors:
+                neighbor_entity = neighbor.get("entity", {})
+                neighbor_doc = neighbor_entity.get("source_doc", "")
+                neighbor_doc_id = _cached_get_doc_id(neighbor_doc)
                 
-                # Step 4: Graph traversal - find related entities
-                neighbors = neo4j_client.get_entity_neighbors(entity["id"], max_depth=2)
-                for neighbor in neighbors:
-                    neighbor_entity = neighbor.get("entity", {})
-                    neighbor_doc = neighbor_entity.get("source_doc", "")
-                    neighbor_doc_id = neo4j_client.get_doc_id_by_filename(neighbor_doc)
-                    
-                    if neighbor_doc_id:
-                        if neighbor_doc_id not in file_scores:
-                            file_scores[neighbor_doc_id] = {
-                                "semantic_score": 0.0,
-                                "entity_score": 0.0,
-                                "graph_score": 0.0
-                            }
-                            file_matched_chunks[neighbor_doc_id] = []
-                            file_matched_entities[neighbor_doc_id] = set()
-                        
-                        # Graph relationship score (weighted by distance)
-                        distance = neighbor.get("distance", 1)
-                        file_scores[neighbor_doc_id]["graph_score"] += 1.0 / distance
-                        file_matched_entities[neighbor_doc_id].add(neighbor_entity.get("name", ""))
+                if not neighbor_doc_id:
+                    continue
+                
+                _ensure_file_entry(neighbor_doc_id)
+                
+                # Graph relationship score (weighted by distance)
+                distance = neighbor.get("distance", 1)
+                file_scores[neighbor_doc_id]["graph_score"] += 1.0 / distance
+                file_matched_entities[neighbor_doc_id].add(neighbor_entity.get("name", ""))
         
         # Step 5: Calculate final scores and rank files
         ranked_files = []
         max_score = 0.0
         file_raw_scores = {}
         
+        # Normalize entity_score to 0-1 range
+        max_entity_score = max((s["entity_score"] for s in file_scores.values()), default=1.0) or 1.0
+        max_graph_score = max((s["graph_score"] for s in file_scores.values()), default=1.0) or 1.0
+        
         for doc_id, scores in file_scores.items():
-            # Weighted combination of scores
+            # Weighted combination of normalized scores
             final_score = (
-                scores["semantic_score"] * 0.5 +  # Semantic similarity
-                scores["entity_score"] * 0.3 +     # Entity matches
-                scores["graph_score"] * 0.2        # Graph relationships
+                scores["semantic_score"] * 0.5 +                          # Already 0-1 from cosine
+                (scores["entity_score"] / max_entity_score) * 0.3 +       # Normalized entity score
+                (scores["graph_score"] / max_graph_score) * 0.2           # Normalized graph score
             )
             file_raw_scores[doc_id] = final_score
             if final_score > max_score:
@@ -181,7 +221,7 @@ async def search_files(request: FileSearchRequest):
             relationships = neo4j_client.get_relationships_by_doc(doc_id)
             relationship_types = list(set([r.get("relationship_type", "") for r in relationships]))[:5]
             
-            # Only include files with meaningful relevance (at least 20% of top score)
+            # Only include files with meaningful relevance
             if normalized_score < 0.2:
                 continue
             
@@ -207,7 +247,6 @@ async def search_files(request: FileSearchRequest):
         # Limit to top_k results
         ranked_files = ranked_files[:top_k]
         
-        # If no files meet threshold, return empty with message
         return FileSearchResponse(
             query=query,
             total_matches=len(ranked_files),
@@ -239,11 +278,22 @@ async def get_file_info(file_id: str):
         # Get chunks
         chunks = vector_store.get_chunks_by_doc(file_id)
         
+        # Get file size from disk
+        file_size = None
+        uploads_dir = Path("./uploads")
+        try:
+            matching = list(uploads_dir.glob(f"{file_id}_*"))
+            if matching:
+                file_size = matching[0].stat().st_size
+        except Exception:
+            pass
+        
         return {
             "file_id": file_id,
             "filename": doc.get("filename", "Unknown"),
             "file_type": doc.get("filename", "").split(".")[-1].lower(),
             "upload_date": doc.get("upload_date", ""),
+            "file_size": file_size,
             "entity_count": len(entities),
             "relationship_count": len(relationships),
             "chunk_count": len(chunks),

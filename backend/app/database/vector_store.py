@@ -4,6 +4,7 @@ Handles vector embeddings storage and similarity search using ChromaDB.
 """
 
 import os
+import re
 from typing import List, Dict, Any, Optional
 import chromadb
 from chromadb.config import Settings
@@ -11,6 +12,10 @@ from chromadb.config import Settings
 
 class VectorStoreClient:
     """ChromaDB client for vector embeddings and similarity search"""
+    
+    # Use a high-quality embedding model (768-dim, best general-purpose model)
+    EMBEDDING_MODEL = "all-mpnet-base-v2"
+    EMBEDDING_DIM = 768
     
     def __init__(self):
         self.host = os.getenv("CHROMA_HOST", "localhost")
@@ -47,11 +52,14 @@ class VectorStoreClient:
     
     @property
     def collection(self):
-        """Get or create the main collection"""
+        """Get or create the main collection with cosine distance metric"""
         if self._collection is None:
             self._collection = self.client.get_or_create_collection(
                 name="knowledge_chunks",
-                metadata={"description": "Document chunks for knowledge graph"}
+                metadata={
+                    "description": "Document chunks for knowledge graph",
+                    "hnsw:space": "cosine"  # Use cosine similarity instead of L2
+                }
             )
         return self._collection
     
@@ -62,6 +70,23 @@ class VectorStoreClient:
             return True
         except Exception:
             return False
+    
+    # ============================================================
+    # Text Preprocessing
+    # ============================================================
+    
+    @staticmethod
+    def preprocess_text(text: str) -> str:
+        """
+        Clean and normalize text before embedding for better similarity results.
+        """
+        # Remove null bytes and control characters (except newlines/tabs)
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+        # Collapse multiple whitespace/newlines into single space
+        text = re.sub(r'\s+', ' ', text)
+        # Strip leading/trailing whitespace
+        text = text.strip()
+        return text
     
     # ============================================================
     # Embedding Operations
@@ -86,7 +111,8 @@ class VectorStoreClient:
                 {
                     "doc_id": chunk["doc_id"],
                     "chunk_index": chunk["chunk_index"],
-                    "source_doc": chunk.get("source_doc", "")
+                    "source_doc": chunk.get("source_doc", ""),
+                    "char_count": len(chunk["text"])
                 }
                 for chunk in chunks
             ]
@@ -130,12 +156,15 @@ class VectorStoreClient:
             chunks = []
             if results["ids"] and results["ids"][0]:
                 for i, chunk_id in enumerate(results["ids"][0]):
+                    distance = results["distances"][0][i] if results["distances"] else 0
+                    # With cosine distance: score = 1 - distance (gives 0-1 similarity)
+                    score = max(0.0, 1.0 - distance)
                     chunks.append({
                         "id": chunk_id,
                         "text": results["documents"][0][i] if results["documents"] else "",
                         "metadata": results["metadatas"][0][i] if results["metadatas"] else {},
-                        "distance": results["distances"][0][i] if results["distances"] else 0,
-                        "score": 1 - results["distances"][0][i] if results["distances"] else 1
+                        "distance": distance,
+                        "score": score
                     })
             
             return chunks
@@ -150,15 +179,16 @@ class VectorStoreClient:
     ) -> List[Dict[str, Any]]:
         """
         Search for similar chunks using text query.
-        ChromaDB will use its default embedding function.
+        Preprocesses the query and generates embeddings with the same model used during indexing.
         
         Args:
             query_text: Text query
             top_k: Number of results to return
         """
         try:
-            # Generate embedding locally
-            query_embedding = self.generate_embeddings([query_text])[0]
+            # Preprocess query text the same way we preprocess chunks
+            clean_query = self.preprocess_text(query_text)
+            query_embedding = self.generate_embeddings([clean_query])[0]
             
             results = self.collection.query(
                 query_embeddings=[query_embedding],
@@ -169,12 +199,14 @@ class VectorStoreClient:
             chunks = []
             if results["ids"] and results["ids"][0]:
                 for i, chunk_id in enumerate(results["ids"][0]):
+                    distance = results["distances"][0][i] if results["distances"] else 0
+                    score = max(0.0, 1.0 - distance)
                     chunks.append({
                         "id": chunk_id,
                         "text": results["documents"][0][i] if results["documents"] else "",
                         "metadata": results["metadatas"][0][i] if results["metadatas"] else {},
-                        "distance": results["distances"][0][i] if results["distances"] else 0,
-                        "score": 1 - results["distances"][0][i] if results["distances"] else 1
+                        "distance": distance,
+                        "score": score
                     })
             
             return chunks
@@ -244,25 +276,29 @@ class VectorStoreClient:
     def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         """
         Generate embeddings for a list of texts using local SentenceTransformer.
-        This runs locally in Python to avoid ChromaDB server timeouts.
+        Uses all-mpnet-base-v2 (768-dim) for high-quality semantic embeddings.
+        Preprocesses texts before embedding for consistency.
         """
         try:
-            # Lazy import and initialization
             from sentence_transformers import SentenceTransformer
             
             if self._embedding_function is None:
-                # Use a small, fast model
-                print("Loading local embedding model (all-MiniLM-L6-v2)...")
-                self._embedding_function = SentenceTransformer('all-MiniLM-L6-v2')
+                print(f"Loading local embedding model ({self.EMBEDDING_MODEL})...")
+                self._embedding_function = SentenceTransformer(self.EMBEDDING_MODEL)
+            
+            # Preprocess all texts before embedding
+            clean_texts = [self.preprocess_text(t) for t in texts]
             
             # Generate embeddings
-            embeddings = self._embedding_function.encode(texts).tolist()
+            embeddings = self._embedding_function.encode(
+                clean_texts,
+                normalize_embeddings=True  # L2-normalize for cosine similarity
+            ).tolist()
             return embeddings
         except Exception as e:
             print(f"Error generating embeddings: {e}")
-            # Fallback to dummy embeddings if model fails
-            return [[0.0] * 384 for _ in texts]
-            
+            raise  # Don't fall back to dummy embeddings — let the caller handle it
+    
     def clear_collection(self):
         """Clear all data from the collection"""
         try:
@@ -271,15 +307,6 @@ class VectorStoreClient:
         except Exception as e:
             print(f"Error clearing collection: {e}")
 
-
-            
-    def clear_collection(self):
-        """Clear all data from the collection"""
-        try:
-            self.client.delete_collection("knowledge_chunks")
-            self._collection = None
-        except Exception as e:
-            print(f"Error clearing collection: {e}")
 
 # Singleton instance
 vector_store = VectorStoreClient()

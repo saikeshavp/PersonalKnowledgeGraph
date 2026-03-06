@@ -5,6 +5,7 @@ Handles text extraction from PDF, DOCX, TXT files and text chunking.
 
 import os
 import io
+import re
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 import uuid
@@ -13,7 +14,7 @@ import uuid
 class DocumentProcessor:
     """Process uploaded documents - extract text and create chunks"""
     
-    def __init__(self, chunk_size: int = 500, chunk_overlap: int = 100):
+    def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 200):
         """
         Initialize document processor.
         
@@ -204,6 +205,11 @@ class DocumentProcessor:
         
         # Extract text
         text = self.extract_text(file_path, file_type)
+        
+        # Preprocess: collapse whitespace, strip control chars
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+        text = re.sub(r'[ \t]+', ' ', text)  # Collapse spaces/tabs but keep newlines
+        text = re.sub(r'\n{3,}', '\n\n', text)  # Max 2 consecutive newlines
         
         # Create chunks
         chunks = self.chunk_text(text, doc_id, filename)

@@ -468,10 +468,33 @@ class Neo4jClient:
                 })
             return relationships
     
+    # Common English stop words to filter out from entity searches
+    STOP_WORDS = {
+        "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+        "of", "with", "by", "from", "is", "it", "as", "be", "was", "were",
+        "are", "been", "has", "have", "had", "do", "does", "did", "will",
+        "would", "could", "should", "may", "might", "can", "shall", "not",
+        "no", "so", "if", "then", "than", "that", "this", "these", "those",
+        "my", "your", "his", "her", "its", "our", "their", "me", "him",
+        "us", "them", "who", "whom", "which", "what", "where", "when",
+        "how", "why", "all", "each", "every", "both", "few", "more",
+        "some", "any", "most", "other", "into", "over", "after", "before",
+        "between", "under", "about", "up", "out", "off", "down", "just",
+        "now", "here", "there", "also", "very", "only", "even", "still",
+        "find", "show", "get", "give", "tell", "notes", "note", "file",
+        "files", "document", "documents", "search", "look", "need",
+    }
+
     def search_entities_by_name(self, query: str) -> List[Dict[str, Any]]:
         """Search entities by name (case-insensitive partial match)"""
-        # Split query into words and search for any match
-        words = query.lower().split()
+        # Split query into words, filter out stop words and short words
+        words = [
+            w for w in query.lower().split()
+            if w not in self.STOP_WORDS and len(w) >= 2
+        ]
+        
+        if not words:
+            return []
         
         cypher_query = """
         MATCH (e:Entity)
